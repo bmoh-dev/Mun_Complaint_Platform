@@ -1,286 +1,416 @@
-# Municipality Complaint Platform — Architecture Audit
+# منصة الشكاوى البلدية — Municipality Complaint Platform
 
-This document is a scholarship-quality audit of the codebase as it exists on disk. Every claim is
-tied to a file reference. Sections marked **Planned / Absent** describe capabilities that are
-referenced in copy or partially scaffolded but not implemented — they are called out explicitly so
-they are not mistaken for shipped behavior.
+A full-stack, Arabic-first (RTL) web platform that connects citizens with their local
+municipalities. Citizens file geo-located complaints with photo/PDF evidence; municipality
+administrators and department teams triage, route, and resolve them; a public transparency
+feed keeps every verified municipality accountable.
 
-## 1. Stack & Runtime
+> **Note on accuracy:** this document describes the codebase as it exists on disk. Sections
+> marked **Planned / Absent** describe capabilities that are referenced in marketing copy or
+> partially scaffolded but not implemented.
 
-- **Framework**: TanStack Start (React, file-based routing via TanStack Router) — `src/router.tsx`,
-  `src/routeTree.gen.ts`, `src/routes/**`.
-- **Backend**: TanStack Start server functions (`createServerFn`) colocated in `src/lib/*.functions.ts`,
-  running against **Supabase** (Postgres + Auth + Storage + Realtime).
-- **Database migrations**: raw SQL under `supabase/migrations/` (39 files), the source of truth for
-  schema, RLS policies, enums, and SECURITY DEFINER RPCs.
-- **UI**: Tailwind + shadcn/radix component library (`src/components/ui/*`).
-- **Locale**: the entire UI is Arabic, RTL (`<html lang="ar" dir="rtl">` in `src/routes/__root.tsx`),
-  including all user-facing error/success strings and rate-limit messaging (formatted in the
-  `Africa/Algiers` timezone — see `src/lib/rate-limit.server.ts`).
+---
 
-## 2. Route Inventory
+## Table of Contents
 
-| Route | File | Access |
-|---|---|---|
-| `/` | `src/routes/index.tsx` | Public landing page; header switches between `PublicHeader`/`AuthenticatedHeader` based on client-side session check. |
-| `/login` | `src/routes/login.tsx` | Public. Google OAuth only, via `lovable.auth.signInWithOAuth("google", …)`. Post-login redirect resolved by role (see §4). |
-| `/feed` | `src/routes/feed.tsx` | Public. Anonymous-safe transparency feed of complaints, scoped to one **verified** municipality at a time (wilaya → municipality drill-down), list/map view, search with rate limiting. |
-| `/_authenticated/*` | `src/routes/_authenticated.tsx` | Layout route; `beforeLoad` requires a live Supabase session, else redirects to `/login?redirect=…`. Wraps all authenticated pages with `AuthenticatedHeader` + `FeedbackButton`. |
-| `/submit` | `_authenticated/submit.tsx` | Any authenticated, onboarded citizen. Complaint submission form. |
-| `/my-complaints` | `_authenticated/my-complaints.tsx` | Citizen's own complaint list/detail. |
-| `/onboarding` | `_authenticated/onboarding.tsx` | Authenticated users with **zero** municipality memberships. Join an existing verified municipality or request a new one (pending platform approval). |
-| `/admin` | `_authenticated/admin.tsx` | Municipality Admin / Super Admin dashboard (guarded by `requireAdminRoute`). |
-| `/admin/departments` | `_authenticated/admin.departments.tsx` | Same guard; department CRUD, admin assignment (super-admin-only writes enforced server-side). |
-| `/admin/users` | `_authenticated/admin.users.tsx` | Same guard; municipality member search & promotion/demotion. |
-| `/department` | `_authenticated/department.tsx` | Department Admin (or municipality admin) dashboard — guarded inline by `beforeLoad` checking `role.isDepartmentAdmin || role.isAdmin`. |
-| `/platform-admin` | `_authenticated/platform-admin.tsx` | Global (platform) Admin only; also reachable pre-bootstrap to claim the first global-admin seat. |
-| `/platform-feedback` | `_authenticated/platform-feedback.tsx` | Global Admin only; feedback/bug-report triage. |
-| `/platform-municipalities` | `_authenticated/platform-municipalities.tsx` | Global Admin only; municipality registration approval/rejection queue. |
+1. [Overview](#1-overview)
+2. [User Roles](#2-user-roles)
+3. [Feature Walkthrough](#3-feature-walkthrough)
+4. [Architecture](#4-architecture)
+5. [Technology Stack](#5-technology-stack)
+6. [Project Structure](#6-project-structure)
+7. [Database & Data Model](#7-database--data-model)
+8. [Security Model](#8-security-model)
+9. [Realtime & Notifications](#9-realtime--notifications)
+10. [Validation, Anti-Spam & Rate Limiting](#10-validation-anti-spam--rate-limiting)
+11. [Environment Variables](#11-environment-variables)
+12. [Getting Started](#12-getting-started)
+13. [Available Scripts](#13-available-scripts)
+14. [Deployment](#14-deployment)
+15. [Known Limitations & Roadmap](#15-known-limitations--roadmap)
+16. [Screenshots](#16-screenshots)
 
-Not-found and error boundaries are centrally defined in `src/routes/__root.tsx`
-(`notFoundComponent`, `errorComponent`) — no route-specific 404/500 handling.
+---
 
-## 3. Roles & Authorization Model
+## 1. Overview
 
-The platform has **two independent role dimensions** that the code explicitly refuses to conflate
-(see comments in `src/lib/authz.server.ts` and `src/lib/departments.functions.ts`):
+The platform digitizes the municipal complaint lifecycle:
 
-1. **Platform role** — `global_admin`, stored in `user_roles`. Grants access to `/platform-admin`,
-   `/platform-municipalities`, `/platform-feedback` only. **Global admin does NOT grant access to
-   any municipality's complaint data** — enforced by `getAdminMunicipalityIds()` explicitly excluding
-   platform role, and by `setDepartmentAdmin` refusing to let a global admin also become a
-   department admin.
-2. **Municipality role** — per-municipality, stored in `municipality_members.role`:
-   `citizen | admin | super_admin`. Determined per membership row, scoped to one municipality at a
-   time, and only effective while `municipalities.status = 'verified'`.
-3. **Department role** — `department_admins` table binds one user to exactly one department
-   (`getMyDepartmentInfo`); department admins can update complaint `status` for complaints assigned
-   to their department but **cannot** write `internal_notes` (municipality-admin-only field —
-   enforced in `departmentUpdateComplaint`).
+```
+Citizen submits complaint
+        │
+        ▼
+Server validates (Zod + anti-spam + rate limits)
+        │
+        ▼
+Auto-routed to a department whose name matches the complaint category
+(or left unassigned → visible to the Municipality General Admin)
+        │
+        ▼
+Department Admin / Municipality Admin updates status,
+optionally transfers to another department in the same municipality
+        │
+        ▼
+Citizen is notified in-app on every status change and transfer
+        │
+        ▼
+Complaint appears on the public transparency feed of its municipality
+```
 
-Bootstrapping the very first global admin is handled by a dedicated RPC
-(`bootstrap_global_admin`, called from `platform.functions.ts`) rather than a hardcoded seed —
-`getPlatformBootstrapState` exposes whether any global admin exists yet, surfaced in
-`AuthenticatedHeader` as a "claim platform admin" prompt when unclaimed.
+Key properties:
 
-### Authorization enforcement pattern
-- All privileged server functions call one of the `authz.server.ts` helpers
-  (`requireMunicipalityAdmin`, `requireMunicipalityAdminFor`, `getMyDepartmentInfo`,
-  `getAdminMunicipalityIds`) or an inline `assertGlobalAdmin`/`assertSuperAdminOf` check — **never**
-  trusting client-supplied role claims.
-- Every admin-scoped list/update query additionally filters `.in("municipality_id", muniIds)` or
-  `.eq("assigned_department_id", departmentId)` server-side (defense in depth beyond the guard
-  check) — see `adminListComplaints`, `listDepartmentComplaints`.
-- `sanitizeSearchTerm()` strips PostgREST filter-injection characters (`, ( ) * \ % " '`) before any
-  user search string is interpolated into a `.or()` filter string — mitigates a documented
-  PostgREST `.or()` injection vector (`src/lib/authz.server.ts`).
-- Route-level guards (`beforeLoad`) are a **UX convenience only**; actual authorization is
-  re-verified independently inside every server function. This is a sound defense-in-depth pattern
-  — client-side route guards alone would be bypassable.
-- Client-side page guards are inconsistent in one respect: `/my-complaints`, `/submit`, and
-  `/onboarding` (see the routes list) do not define their own `beforeLoad`; they rely solely on the
-  parent `_authenticated` layout's session check, with authorization narrowing (e.g. "must not
-  already belong to a municipality" for onboarding) done client-side via a query result and a
-  `navigate()` redirect rather than a route guard — this is authorization-by-UI, not a security
-  boundary, but the underlying server functions (`joinMunicipality`, `createMunicipality`, etc.)
-  independently re-validate state server-side, so no privilege escalation is actually possible.
+- **Arabic-first**: the entire UI is Arabic with full RTL layout (`<html lang="ar" dir="rtl">`),
+  including server-side error and rate-limit messages (formatted in the `Africa/Algiers` timezone).
+- **Multi-tenant**: every complaint, department, and membership is strictly scoped to one
+  municipality, enforced server-side on every privileged query.
+- **Transparency by default**: each verified municipality has a public, read-only feed of its
+  complaints (list + map), searchable by anyone without an account.
 
-## 4. Authentication
+## 2. User Roles
 
-- **Provider**: Google OAuth exclusively, via `@lovable.dev/cloud-auth-js` (`lovable.auth.signInWithOAuth`)
-  — no password/email-link login path exists (`src/routes/login.tsx`).
-- **Session**: standard Supabase client session (`src/integrations/supabase/client.ts`), propagated
-  to server functions as a `Bearer` JWT validated in `requireSupabaseAuth`
-  (`src/integrations/supabase/auth-middleware.ts`), which:
-  - Rejects missing/non-Bearer/malformed (non-3-segment JWT) tokens outright.
-  - Calls `supabase.auth.getClaims(token)` server-side (not merely decoding the JWT) to verify
-    validity, and requires a `sub` claim.
-  - Constructs a **request-scoped Supabase client** authenticated as the caller (RLS-respecting),
-    exposed to handlers as `context.supabase`, alongside a separate always-privileged
-    `supabaseAdmin` (service-role) client (`client.server.ts`) used deliberately in most handlers to
-    perform explicit, code-level authorization instead of relying purely on RLS.
-- **Auto-provisioning**: `handle_new_user()` Postgres trigger on `auth.users` INSERT auto-creates a
-  `profiles` row and a default `citizen` role (`user_roles`) on first login
-  (migration `20260601141252`).
-- **Post-login routing** (`resolveLandingPath()` in `login.tsx`): pending owned municipality
-  request → onboarding; else global admin → `/platform-admin`; else municipality super admin →
-  `/admin`; else department admin → `/department`; else `/feed`. New users with no memberships are
-  routed to `/onboarding` (via the memberships-length check, not shown in this priority list but
-  enforced in `onboarding.tsx`'s own redirect-away-if-already-a-member logic and
-  `getMyOnboardingState().needsOnboarding`).
-- **Sign-out**: clears in-progress complaint drafts from local storage, cancels/clears the React
-  Query cache, then calls `supabase.auth.signOut()` (`AuthenticatedHeader.tsx`).
+The platform deliberately separates **three non-overlapping role dimensions**:
 
-## 5. Municipalities
+| Role | Stored in | Scope | Capabilities |
+|---|---|---|---|
+| **Citizen** | `municipality_members.role = 'citizen'` | One municipality per membership row | Join verified municipalities, submit/track own complaints, submit feedback |
+| **Department Admin** | `department_admins` (one user per department) | Exactly one department | View assigned complaints, update their **status**, transfer them within the same municipality. **Cannot** write `internal_notes` |
+| **Municipality Admin / Super Admin** | `municipality_members.role = 'admin' \| 'super_admin'` | Their municipality only | Full complaint management, bulk status updates, bulk transfers, `internal_notes`, department CRUD, member management (super admin) |
+| **Platform (Global) Admin** | `user_roles.role = 'global_admin'` | Platform-wide, **no** access to municipality complaint data | Approve/reject municipality registrations, manage global admins, triage the feedback center |
 
-- **Lifecycle**: `pending → verified | rejected` (`municipality_status` enum,
-  migration `20260608212847`).
-- Any authenticated user may **create** a municipality request (`createMunicipality`,
-  `municipalities.functions.ts`), rate-limited to 3/24h, blocked if the user already has a pending
-  request, and blocked on case-insensitive name+wilaya duplicates.
-- Only a **global admin** can approve (`platformAdminApprove`) or reject
-  (`platformAdminReject`) a pending municipality. Approval atomically: marks it verified, creates a
-  `super_admin` membership for the requester, and grants them the `super_admin` platform-visible
-  role row.
-- Citizens **join** verified municipalities (`joinMunicipality`, rate-limited 20/24h) as `citizen`
-  role members; duplicate joins are silently absorbed.
-- All municipality-scoped reads/writes re-check `status = 'verified'` server-side even after
-  approval (e.g. `submitComplaint`, `listPublicComplaints`) — a municipality that is later
-  hypothetically de-verified would stop accepting/serving complaints (there is, however, **no UI
-  path to revoke verification** once granted — Planned/Absent).
-- **Municipality Super Admin management** (`users.functions.ts`): promote/demote/transfer
-  super-admin status by email, with an explicit floor of ≥1 super admin per municipality at all
-  times (`countSuperAdmins` guard in `muniDemoteToCitizen`/`muniTransferSuperAdminByEmail`).
+> The separation is enforced in code, not just by convention: `getAdminMunicipalityIds()`
+> explicitly excludes the platform role, and `setDepartmentAdmin` refuses to make a global
+> admin a department admin. A global admin **cannot** read any municipality's complaints.
 
-## 6. Departments
+## 3. Feature Walkthrough
 
-- Each department belongs to exactly one municipality (`departments.municipality_id`) and has a
-  `slug` (matched against complaint `category` for auto-routing) and `is_active` flag.
-- **Auto-assignment**: on submission, if the target municipality has an active department whose
-  `slug` equals the chosen complaint `category`, the complaint is auto-assigned
-  (`submitComplaint` in `complaints.functions.ts`); otherwise it is left unassigned and remains
-  visible to the Municipality (General) Admin — submission is never blocked by absence of a
-  matching department.
-- **Department Admin assignment**: exactly one user per department (`department_admins`), settable
-  only by a municipality **super_admin** of that department's own municipality
-  (`setDepartmentAdmin`); a platform global admin is explicitly barred from also being made a
-  department admin.
-- **Department CRUD & deletion**: `listDepartmentsWithStats`, `deleteDepartment` — deletion is an
-  atomic SECURITY DEFINER RPC (`delete_department_atomic`) that unassigns affected complaints
-  (`assigned_department_id = NULL`, preserving the original `category`), removes the department-admin
-  binding, then deletes the department row — restricted to the department's municipality's
-  super_admin, enforced inside the DB function itself (not just the calling server function).
-- **Routing / transfer**: `redirectComplaint` allows a department admin (of the complaint's current
-  department) or a municipality admin to reassign a complaint to another department in the *same*
-  municipality only, or back to unassigned/"General Admin". Every transfer is recorded in
-  `complaint_routing_history` (actor, from/to department, optional reason, timestamp) and triggers
-  notifications to the citizen and to all admins of the receiving department. `listRoutingHistory`
-  exposes this audit trail to authorized viewers with department names and actor names resolved.
-- Bulk transfer for municipality admins is available via `bulkTransferComplaints`, delegated to the
-  `bulk_transfer_complaints` SECURITY DEFINER RPC for atomicity across many complaints at once.
+### 3.1 Public Landing Page (`/`)
+Marketing entry point. The header switches between public and authenticated variants based on
+the client-side session.
 
-## 7. Complaint Lifecycle
+### 3.2 Authentication (`/login`)
+Google OAuth only (via Lovable's auth broker). On first login a Postgres trigger
+(`handle_new_user`) auto-provisions a `profiles` row and a default `citizen` role.
+Post-login routing (`resolveLandingPath`):
 
-1. **Submission** (`submitComplaint`, citizen, `/submit`):
-   - Validated with Zod: title (3–200 chars), fixed category enum (12 categories), address
-     (3–500), description (5–5000), optional lat/lng, up to 6 attachments.
-   - Rate-limited: 5/hour and 20/day per user (`RATE_LIMITS.complaintSubmitHour/Day`).
-   - Attachment shape re-validated server-side (`validateAttachmentSet`) regardless of client
-     checks: MIME allow-list (JPEG/PNG/WEBP/HEIC images ≤5 MB, PDF ≤10 MB), max 5 images + 1 PDF
-     per complaint, 6 attachments total.
-   - **Spam/quality filtering** (`detectSpam`, `src/lib/spam-detection.ts`) rejects: too-short text,
-     excessive character repetition, keyboard-mash patterns (QWERTY/AZERTY/Arabic-layout smash
-     sequences, in both directions), and (for descriptions) fewer than 3 distinct real words —
-     returned as a normal validation error, not a thrown exception, to avoid tripping the client
-     error boundary.
-   - Requires the submitter to already be a member of a **verified** target municipality; rejects
-     otherwise.
-   - Attachment bytes successfully persisted count against a 100 MB/hour/user upload-bandwidth
-     budget (`enforceUploadBandwidth`), tracked via the same generic rate-limit RPC with a byte
-     "amount" instead of a request count.
-2. **Status values**: `pending → in_progress → resolved` (free-form transitions, not a strict state
-   machine — any authorized actor can set any of the three values in any order).
-3. **Visibility**:
-   - Citizen sees only their own complaints (`listMyComplaints`, `getMyComplaint` — ownership
-     checked explicitly, not just via RLS).
-   - Department admin sees complaints assigned to their department only.
-   - Municipality admin/super_admin sees all complaints across every municipality they administer,
-     with cross-municipality isolation enforced by an explicit `.in("municipality_id", muniIds)`
-     filter on every query.
-   - Public feed (`listPublicComplaints`) shows all complaints of one verified municipality at a
-     time (no cross-municipality browsing in one call), excluding `internal_notes` and citizen
-     identity, with attachments exposed via short-lived (1 hour) signed URLs
-     (`signAttachments`/`SIGNED_URL_TTL`).
-4. **Editing/closing**: municipality admins can bulk-update `status` and/or `internal_notes`
-   (`adminUpdate`); department admins can update `status` only, never `internal_notes`.
-5. **Search**: admin/department list endpoints support free-text search across title/description/
-   complaint_number and an exact ID match when the term looks like a UUID; public and
-   user-search endpoints are rate-limited (60/min and 20/min respectively).
-6. **Complaint numbering**: human-readable `CMP-000123`-style sequential identifiers assigned by a
-   DB trigger (`assign_complaint_number`, backed by `complaint_number_seq`), independent of the
-   internal UUID primary key.
+| User state | Lands on |
+|---|---|
+| Pending owned municipality request | `/onboarding` |
+| Global admin | `/platform-admin` |
+| Municipality super admin | `/admin` |
+| Department admin | `/department` |
+| No memberships | `/onboarding` |
+| Otherwise | `/feed` |
 
-## 8. Notifications
+### 3.3 Onboarding (`/onboarding`)
+Users with zero municipality memberships either **join** an existing verified municipality
+(as a citizen) or **request a new municipality** (rate-limited, enters a `pending` queue
+reviewed by a global admin).
 
-- **Storage**: `notifications` table (`user_id`, `complaint_id`, `title`, `body`, `read`,
-  `created_at`), RLS-scoped so a user can only read/update their own rows (initial migration).
-- **Triggers that create notifications**:
-  - A DB trigger fires on complaint `status` change and notifies the complaint owner
-    (`handle_complaint_status_change`, initial migration) — this predates and is independent of the
-    department-routing feature.
-  - Application-level inserts on department transfer (`redirectComplaint`): one notification to the
-    citizen, one to each admin of the newly-assigned department.
-- **Delivery**: **Supabase Realtime** is wired up client-side —
-  `AuthenticatedHeader.tsx`'s `NotificationsMenu` opens a `postgres_changes` channel filtered to
-  `user_id=eq.<uid>` on the `notifications` table and invalidates the notifications/my-complaints
-  React Query caches on any change, layered on top of a 15-second `refetchInterval` poll as a
-  fallback. `public.notifications` and `public.complaints` are both added to the
-  `supabase_realtime` publication (initial migration). This is a genuinely implemented realtime
-  feature, not merely aspirational copy — although it is the **only** realtime channel in the app;
-  no other page (e.g. admin/department complaint lists) subscribes to live updates.
-- **User actions**: mark one/all as read, delete one/all (`markNotificationsRead`,
-  `deleteNotifications`), both ownership-scoped server-side.
-- **Absent**: no email/SMS/push notification channel — in-app only. No user-configurable
-  notification preferences.
+### 3.4 Complaint Submission (`/submit`)
+- Validated with Zod: title 3–200 chars, one of the platform-wide categories, address 3–500,
+  description 5–5000, optional map coordinates, up to 6 attachments
+  (≤5 images + ≤1 PDF, MIME/size allow-listed **server-side**).
+- Anti-spam heuristics reject repeated-character text, keyboard-mash patterns
+  (QWERTY/AZERTY/Arabic layouts), and low-content descriptions.
+- Rate-limited per user (5/hour, 20/day) plus a 100 MB/hour upload bandwidth budget.
+- **Server-side routing**: the client sends only municipality + category; the server assigns
+  the complaint to the active department whose name matches the category, or leaves it
+  unassigned (never blocks submission).
+- Each complaint receives a human-readable `CMP-000123`-style number via a DB trigger.
 
-## 9. Feedback (in-app bug/suggestion reporting)
+### 3.5 My Complaints (`/my-complaints`)
+Citizens track only their own complaints (ownership enforced in the server functions, not
+just RLS), with detail dialogs and signed-URL attachment previews.
 
-- Any authenticated user can submit feedback (`submitFeedback`, `FeedbackButton.tsx`/
-  `FeedbackDialog.tsx`): type `bug|suggestion`, title, description, optional page context, optional
-  screenshot.
-- Rate-limited to 10/hour/user; text run through the same spam-detection filter as complaints.
-- Screenshot path ownership is verified server-side (`screenshot_path` must start with the caller's
-  own `userId` folder segment) before being trusted, then served back only via a signed URL
-  (`getFeedbackDetail`).
-- Full CRUD/triage (`listAllFeedback`, `getFeedbackDetail`, `updateFeedbackStatus`,
-  `updateFeedbackAdminNotes`, `deleteFeedback`) is **global-admin only**, at `/platform-feedback`.
-  Statuses: `open | fixed`.
+### 3.6 Public Transparency Feed (`/feed`)
+Anonymous-safe feed scoped to **one verified municipality at a time**
+(wilaya → municipality drill-down), with list/map views and rate-limited search.
+Exposes only intentionally public fields — never `internal_notes` or citizen identity.
+Attachments are served via short-lived (1 hour) signed URLs.
 
-## 10. Security Mechanisms — Summary
+### 3.7 Municipality Admin Dashboard (`/admin`)
+- Complaint table with search, filters, date range, and pagination.
+- Opens filtered to **General** (unassigned) complaints by default.
+- Status updates, internal notes, **bulk status update** and **bulk transfer** actions.
+- Cross-municipality isolation: every query is additionally filtered by the admin's own
+  municipality IDs server-side.
+
+### 3.8 Department Management (`/admin/departments`)
+Municipality admins create, rename, activate/deactivate, and delete their own departments.
+Deletion is an atomic SECURITY DEFINER RPC (`delete_department_atomic`): affected complaints
+are unassigned (category preserved), the department-admin binding is removed, then the
+department is deleted — all in one transaction. Creating a department whose name matches a
+category automatically back-fills **unassigned, unsolved** historical complaints of that
+category in the same municipality.
+
+### 3.9 User Management (`/admin/users`)
+Municipality super admins search members with debounced autocomplete (min 2 chars, max 10
+results), promote/demote municipality roles, and assign department admins. A "last super
+admin" guard prevents locking a municipality out of its own administration.
+
+### 3.10 Department Dashboard (`/department`)
+Department admins see only complaints assigned to their department. They can update status
+and transfer to another department in the same municipality — or back to the **Municipality
+General Admin** (always offered, even when no other department exists). Every transfer is
+recorded in `complaint_routing_history` with actor, from/to department, reason, and timestamp.
+
+### 3.11 Platform Administration
+- `/platform-admin` — global admin dashboard; also hosts the one-time **bootstrap** that
+  claims the first global-admin seat (`bootstrap_global_admin` RPC, exactly one
+  initialization path — no hardcoded email bootstrap exists).
+- `/platform-municipalities` — approve/reject pending municipality registrations. Approval
+  atomically verifies the municipality and seats its requester as super admin.
+- `/platform-feedback` — triage for the built-in feedback center (see below).
+
+### 3.12 Feedback Center
+Authenticated users report bugs/suggestions from a floating button on every authenticated
+page. Submissions capture route, timestamp, and user automatically, accept one optional
+screenshot, and pass the same anti-spam validation as complaints. Global admins review,
+annotate (private `admin_notes`), update status (`open → fixed`), or delete items at
+`/platform-feedback`.
+
+## 4. Architecture
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│                        Browser (React 19)                     │
+│  TanStack Router (file routes) · TanStack Query · shadcn/ui   │
+│  Supabase JS client (publishable key, RLS as the user)        │
+└───────────────┬──────────────────────────────┬───────────────┘
+                │ typed RPC                     │ realtime
+                ▼                               ▼
+┌──────────────────────────────┐   ┌────────────────────────────┐
+│  TanStack Start server fns    │   │  Supabase Realtime          │
+│  (createServerFn, edge        │   │  (notifications channel)    │
+│   runtime / Cloudflare Worker)│   └────────────────────────────┘
+│  • requireSupabaseAuth        │
+│    middleware (JWT verified   │
+│    via getClaims)             │
+│  • explicit authz helpers     │
+│  • service-role client used   │
+│    deliberately, with code-   │
+│    level authorization        │
+└───────────────┬──────────────┘
+                ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    Supabase (Postgres)                        │
+│  Tables + RLS + SECURITY DEFINER RPCs + triggers + Storage   │
+│  39 SQL migrations = source of truth for schema & policies   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Design decisions worth knowing:
+
+- **Server functions, not edge functions**: all app-internal logic uses TanStack Start
+  `createServerFn`; there are no Supabase Edge Functions.
+- **Defense in depth**: route-level `beforeLoad` guards are a UX convenience; every server
+  function independently re-verifies authentication, role, municipality membership, and
+  resource ownership via centralized helpers in `src/lib/authz.server.ts` — never trusting
+  client-supplied role claims.
+- **Explicit authorization over pure RLS**: privileged handlers use the service-role client
+  and enforce multi-tenant scoping in TypeScript (centralized, auditable), with RLS as a
+  second layer. The public feed uses the publishable client behind narrow `TO anon` policies.
+
+## 5. Technology Stack
+
+| Layer | Technologies |
+|---|---|
+| **Framework** | React 19, TypeScript 5.8, TanStack Start v1 (SSR + server functions), Vite 7 |
+| **Routing** | TanStack Router (file-based) |
+| **Data fetching** | TanStack Query 5 |
+| **Forms & validation** | React Hook Form, Zod, `@hookform/resolvers` |
+| **Styling** | Tailwind CSS v4 (CSS-first config), `tw-animate-css`, OKLCH design tokens |
+| **UI components** | shadcn/ui (New York style) on Radix UI primitives |
+| **Icons** | Lucide React |
+| **Maps** | Leaflet + React Leaflet (map picker, feed map view) |
+| **Backend / BaaS** | Supabase via Lovable Cloud — Postgres, Auth (Google OAuth), Storage, Realtime, RLS |
+| **Server runtime** | Nitro / Cloudflare Worker edge runtime |
+| **Tooling** | ESLint 9, Prettier, `vite-tsconfig-paths` |
+
+## 6. Project Structure
+
+```text
+src/
+├── routes/                    # File-based routes
+│   ├── __root.tsx             # App shell, RTL <html>, error/not-found boundaries
+│   ├── index.tsx              # Public landing page
+│   ├── login.tsx              # Google OAuth + role-based landing resolver
+│   ├── feed.tsx               # Public transparency feed
+│   ├── _authenticated.tsx     # Session gate layout (header + feedback button)
+│   └── _authenticated/
+│       ├── submit.tsx             # Complaint form
+│       ├── my-complaints.tsx      # Citizen's complaints
+│       ├── onboarding.tsx         # Join / request municipality
+│       ├── admin.tsx              # Municipality admin dashboard
+│       ├── admin.departments.tsx  # Department CRUD
+│       ├── admin.users.tsx        # Member management
+│       ├── department.tsx         # Department admin queue
+│       ├── platform-admin.tsx     # Global admin + bootstrap
+│       ├── platform-municipalities.tsx
+│       └── platform-feedback.tsx  # Feedback triage
+├── lib/
+│   ├── *.functions.ts         # Server functions (complaints, departments, users,
+│   │                          #   municipalities, platform, feedback, notifications)
+│   ├── authz.server.ts        # Centralized authorization helpers
+│   ├── rate-limit.server.ts   # DB-backed atomic rate limiting
+│   ├── spam-detection.ts      # Anti-spam heuristics
+│   └── upload-validation.ts   # Server-side attachment allow-listing
+├── integrations/supabase/     # Generated clients, auth middleware/attacher
+├── components/                # shadcn/ui library + app components
+└── styles.css                 # Tailwind v4 theme tokens (OKLCH), RTL
+
+supabase/migrations/           # 39 SQL migrations — schema, RLS, enums, RPCs
+```
+
+## 7. Database & Data Model
+
+Core tables (simplified):
+
+```text
+auth.users ──1:1── profiles
+     │
+     ├── user_roles            (platform roles: global_admin)
+     │
+     └── municipality_members ──N:1── municipalities (pending → verified | rejected)
+              │                         │
+              │                         ├── departments ──0:1── department_admins
+              │                         │
+              │                         └── complaints ──*── complaint_attachments
+              │                                   │
+              │                                   ├── complaint_routing_history
+              │                                   └── notifications (per user)
+
+feedback                       (platform-wide bug reports / suggestions)
+role_audit_log                 (role-change audit trail)
+rate_limit_counters            (server-only rate limiting)
+```
+
+Conventions:
+
+- Complaints carry both a UUID primary key and a sequential `CMP-000123` number
+  (assigned by trigger).
+- Municipality-scoped reads/writes re-check `municipalities.status = 'verified'` server-side.
+- Storage buckets are private; all attachment/screenshot access goes through 1-hour signed URLs.
+- Every public-schema table is created with explicit `GRANT`s, RLS enabled, and policies in
+  the same migration.
+
+## 8. Security Model
 
 | Mechanism | Where |
 |---|---|
-| JWT verification via Supabase `getClaims` (not local decode) | `auth-middleware.ts` |
-| Server-side re-verification of every role/scope claim (never trusts client) | `authz.server.ts`, every `*.functions.ts` |
-| Postgres Row-Level Security on all tables (profiles, user_roles, complaints, attachments, notifications, and municipality/department tables added in later migrations) | `supabase/migrations/*` |
+| JWT verified server-side via `getClaims` (never just decoded) | `auth-middleware.ts` |
+| Centralized re-verification of role, membership, and resource ownership | `authz.server.ts`, every `*.functions.ts` |
+| Row-Level Security on all tables | `supabase/migrations/*` |
 | PostgREST `.or()` filter-injection sanitization | `sanitizeSearchTerm()` |
-| Generic, DB-backed atomic rate limiting (`rl_check_and_consume` RPC) applied per action/subject | `rate-limit.server.ts`, `rate-limits.ts` |
-| Upload MIME/size/count allow-listing enforced server-side independent of client | `upload-validation.ts` |
-| Spam/low-quality text heuristics on complaints and feedback | `spam-detection.ts` |
-| Signed, time-limited (1h) URLs for all attachment/screenshot access — no public bucket listing of arbitrary files | `signAttachments`, `getFeedbackDetail` |
-| Least-privilege separation: platform role vs. municipality role vs. department role, explicitly non-overlapping | `authz.server.ts` design comments, `setDepartmentAdmin` |
-| "Last admin" protections preventing total lockout | `changeUserRole` (last global-scope admin), `muniDemoteToCitizen`/`muniTransferSuperAdminByEmail` (last super_admin per municipality) |
-| Audit trail for role changes and complaint routing | `role_audit_log` table (`changeUserRole`), `complaint_routing_history` table |
-| Atomic multi-step privileged mutations as SECURITY DEFINER SQL functions rather than app-level multi-query sequences | `bulk_transfer_complaints`, `delete_department_atomic`, `bootstrap_global_admin`, `promote_global_admin`, `transfer_global_admin`, `abandon_global_admin` |
-| Fail-safe rate limiter (fails open on infra error, logged) | `enforceRateLimit()` — a deliberate availability/security tradeoff worth flagging: an outage of the rate-limit RPC silently disables abuse protection rather than blocking legitimate traffic |
+| Atomic DB-backed rate limiting per action/subject | `rate-limit.server.ts` |
+| Server-side MIME/size/count allow-listing for uploads | `upload-validation.ts` |
+| Anti-spam text heuristics (complaints & feedback) | `spam-detection.ts` |
+| Short-lived signed URLs for all media — no public bucket listing | `signAttachments` |
+| Strict separation of platform vs. municipality vs. department roles | `authz.server.ts` |
+| "Last admin" lockout protections | `changeUserRole`, `muniDemoteToCitizen`, `muniTransferSuperAdminByEmail` |
+| Atomic privileged mutations as SECURITY DEFINER RPCs | `bulk_transfer_complaints`, `delete_department_atomic`, `bootstrap_global_admin`, `promote_global_admin`, `transfer_global_admin`, `abandon_global_admin` |
+| Audit trails | `role_audit_log`, `complaint_routing_history` |
 
-## 11. Ambiguities & Gaps Worth Flagging
+## 9. Realtime & Notifications
 
-- **Legacy schema drift**: the very first migration defines `app_role` as only `admin|citizen` and
-  `complaint_category` with only 4 values; later migrations (not individually enumerated here)
-  clearly extend these (12 categories are validated in `complaints.functions.ts`, and
-  `global_admin`/`super_admin` roles are used throughout the app code) — the true current enum
-  definitions live in later migration files not reviewed line-by-line in this audit; readers
-  extending the schema should diff current DB enum state directly rather than trust the first
-  migration file alone.
-- **RLS vs. app-layer authorization overlap**: many handlers use the service-role `supabaseAdmin`
-  client and re-implement authorization checks in TypeScript rather than relying on RLS policies
-  for those tables/queries. This is defensible (centralizes complex multi-tenant scoping logic that
-  RLS alone struggles to express cleanly) but means RLS policies alone are **not** sufficient
-  documentation of the true access-control surface — this audit is based on the TypeScript checks,
-  which are the actual enforcement point for those endpoints.
-- **No automated tests found** in the repository for authorization boundaries, rate limits, or
-  complaint lifecycle — this audit is based on static code reading only, not test evidence.
-- **No de-verification / suspension workflow** for municipalities once approved (§5).
-- **No password-based or email/link login** — Google OAuth is a hard dependency; there is no
-  fallback if a user has no Google account.
-- **No push/email notifications** — despite the homepage marketing copy promising "إشعارات فورية"
-  (instant notifications), delivery is limited to in-app Realtime + polling; there is no evidence of
-  any email or SMS integration anywhere in the codebase (Planned/Absent, contradicts marketing copy
-  in `src/routes/index.tsx`).
-- **Realtime is single-purpose**: only the notification bell subscribes to `postgres_changes`;
-  admin/department complaint dashboards do not live-update and require manual refresh or React
-  Query cache invalidation triggers to see new/changed complaints from other actors.
-- **Complaint status is not a strict state machine** — nothing in the code prevents moving a
-  complaint from `resolved` back to `pending`, for example; this may be intentional flexibility or
-  an oversight depending on product intent.
+- Status changes fire a DB trigger (`handle_complaint_status_change`) that notifies the
+  complaint owner; department transfers add application-level notifications to the citizen
+  and the receiving department's admins.
+- Delivery is **Supabase Realtime** (`postgres_changes` on the `notifications` table,
+  filtered to the current user) plus a 15-second polling fallback in the notification menu.
+- Per-notification actions: open the related complaint, mark as read, delete; global actions:
+  mark all as read, delete all.
+- **Planned / Absent:** no email/SMS/push channel — notifications are in-app only.
+
+## 10. Validation, Anti-Spam & Rate Limiting
+
+- **Zod schemas** on every server function input.
+- **Anti-spam** (`spam-detection.ts`): rejects repetition-dominant text (e.g. `دسسسسسسس`,
+  `aaaaaaaaa`), keyboard-mash sequences (`qwerty`, `asdfghjkl`, `azerty`, Arabic-layout
+  smashes, both directions), and descriptions with fewer than 3 distinct real words —
+  returned as ordinary validation errors (form stays open, Arabic message shown), never as
+  unhandled exceptions.
+- **Rate limits** (DB-backed, atomic): complaint submission 5/h + 20/day, municipality
+  creation 3/24h, municipality join 20/24h, search 60/min (admin) / 20/min (public),
+  feedback 10/h, uploads 100 MB/h bandwidth budget. The limiter fails open on infrastructure
+  errors (deliberate availability tradeoff, logged).
+
+## 11. Environment Variables
+
+| Variable | Where | Purpose |
+|---|---|---|
+| `VITE_SUPABASE_URL` | client | Supabase project URL |
+| `VITE_SUPABASE_PUBLISHABLE_KEY` | client | Publishable (anon) key |
+| `SUPABASE_URL` | server | Same URL for server functions |
+| `SUPABASE_PUBLISHABLE_KEY` | server | Public read-only server queries |
+| `SUPABASE_SERVICE_ROLE_KEY` | server only | Privileged operations via `client.server.ts` |
+
+On Lovable Cloud all of these are injected automatically — no manual setup.
+
+## 12. Getting Started
+
+```bash
+# install dependencies
+bun install        # or: npm install
+
+# start the dev server
+bun run dev        # http://localhost:8080
+```
+
+Database schema is managed through SQL migrations (`supabase/migrations/`); on Lovable Cloud
+they are applied automatically. The first global admin is claimed in-app via the bootstrap
+prompt shown in the authenticated header when no global admin exists yet — there is no
+seeded or hardcoded administrator.
+
+## 13. Available Scripts
+
+| Script | Command |
+|---|---|
+| `dev` | `vite dev` |
+| `build` | `vite build` |
+| `build:dev` | `vite build --mode development` |
+| `preview` | `vite preview` |
+| `lint` | `eslint .` |
+| `format` | `prettier --write .` |
+
+## 14. Deployment
+
+The app builds to an edge (Cloudflare Worker-compatible) bundle via Nitro and deploys
+through Lovable's publishing flow. All npm dependencies are fully bundled at build time;
+server functions run in a stateless Worker runtime (no `child_process`, native binaries, or
+arbitrary filesystem access).
+
+## 15. Known Limitations & Roadmap
+
+- **Google OAuth is a hard dependency** — no password or email-link fallback.
+- **In-app notifications only** — no email/SMS/push delivery, despite landing-page copy.
+- **Realtime is single-purpose** — only the notification bell subscribes live; admin and
+  department dashboards refresh via React Query invalidation.
+- **No municipality de-verification/suspension workflow** once approved.
+- **Complaint status is not a strict state machine** — any authorized actor can set any of
+  `pending | in_progress | resolved` in any order (intentional flexibility).
+- **No automated test suite** for authorization boundaries, rate limits, or the complaint
+  lifecycle — a clear next contribution area.
+
+## 16. Screenshots
+
+The repository does not currently bundle screenshots. Recommended captures, in order:
+
+| # | Page | Suggested file |
+|---|---|---|
+| 1 | Public landing page (`/`) | `docs/screenshots/landing.png` |
+| 2 | Public transparency feed, map view (`/feed`) | `docs/screenshots/feed-map.png` |
+| 3 | Complaint submission form (`/submit`) | `docs/screenshots/submit.png` |
+| 4 | Municipality admin dashboard (`/admin`) | `docs/screenshots/admin-dashboard.png` |
+| 5 | Department admin queue (`/department`) | `docs/screenshots/department.png` |
+| 6 | Platform administration (`/platform-admin`) | `docs/screenshots/platform-admin.png` |
+
+Then embed them here, e.g.:
+
+```markdown
+![Public transparency feed](docs/screenshots/feed-map.png)
+```
+
+---
+
+*Built with React 19, TanStack Start, Tailwind CSS v4, shadcn/ui, and Supabase (Lovable Cloud).*
